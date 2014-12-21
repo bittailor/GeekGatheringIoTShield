@@ -6,7 +6,6 @@
 #include <BtMqttSn.h>
 #include <MPU6050_6Axis_MotionApps20.h>
 
-
 //-----
 
 #define TEAM_ID 5
@@ -28,7 +27,7 @@
 #define TOPIC_BUTTON_B TOPIC_BASE "Button/B"
 #define TOPIC_GYRO_YAW TOPIC_BASE "Gyro/Yaw"
 #define TOPIC_GYRO_PITCH TOPIC_BASE "Gyro/Pitch"
-#define TOPIC_GYRO_ROW TOPIC_BASE "Gyro/Row"
+#define TOPIC_GYRO_ROLL TOPIC_BASE "Gyro/Roll"
 
 #define TOPIC_BUZZER TOPIC_BASE "Buzzer"
 #define TOPIC_SERVO TOPIC_BASE "Servo"
@@ -100,16 +99,16 @@ class AnalogInputPublisher {
     public:
 
     AnalogInputPublisher(uint8_t iPin, const char* iTopic, int iThreshold)
-    : mPin(iPin), mTopic(iTopic), mThreshold(iThreshold), mLastValue(0) {
+    : mPin(iPin), mTopic(iTopic), mThreshold(iThreshold), mLastPublishedValue(0) {
     }
 
     void publish(MqttSnClient& iClient, bool iOnlyWhenChanged)
     {
         int value = analogRead(mPin);
-        if(iOnlyWhenChanged && abs(value-mLastValue) < mThreshold) {
+        if(iOnlyWhenChanged && abs(value-mLastPublishedValue) < mThreshold) {
             return;
         }
-        mLastValue = value;
+        mLastPublishedValue = value;
         iClient.publish(mTopic, itoa(value,sConvertbuffer,10));
     }
 
@@ -117,11 +116,93 @@ class AnalogInputPublisher {
     uint8_t mPin;
     const char* mTopic;
     int mThreshold;
-    int mLastValue;
+    int mLastPublishedValue;
 };
 
 //-----
 
+class MpuPublisher {
+    public:
+
+        MpuPublisher()
+        : mThreshold(1.0 * M_PI / 180) {
+        }
+
+
+        void begin() {
+            Wire.begin();
+            TWBR = 24;
+            mMpu.initialize();
+            //Serial << F("Initializing DMP...") << endl;
+            uint8_t devStatus = mMpu.dmpInitialize();
+            // supply your own gyro offsets here, scaled for min sensitivity
+            mMpu.setXGyroOffset(220);
+            mMpu.setYGyroOffset(76);
+            mMpu.setZGyroOffset(-85);
+            mMpu.setZAccelOffset(1688); // 1688 factory default for my test chip
+
+            // make sure it worked (returns 0 if so)
+            if (devStatus == 0) {
+                // turn on the DMP, now that it's ready
+                mMpu.setDMPEnabled(true);
+                mPacketSize = mMpu.dmpGetFIFOPacketSize();
+            } else {
+                // ERROR!
+                // 1 = initial memory load failed
+                // 2 = DMP configuration updates failed
+                // (if it's going to break, usually the code will be 1)
+                Serial << F("DMP failed :")  << devStatus << endl;
+            }
+        }
+
+        void loop(){
+            uint8_t mpuIntStatus = mMpu.getIntStatus();
+            uint16_t fifoCount = mMpu.getFIFOCount();
+
+            if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+                Serial << F("MPU reset fifo") << endl;
+                mMpu.resetFIFO();
+            } else if (mpuIntStatus & 0x02) {
+                // wait for correct available data length, should be a VERY short wait
+                while (fifoCount < mPacketSize) fifoCount = mMpu.getFIFOCount();
+
+                // read a packet from FIFO
+                mMpu.getFIFOBytes(mFifoBuffer, mPacketSize);
+
+                Quaternion q;
+                VectorFloat gravity;
+
+                mMpu.dmpGetQuaternion(&q, mFifoBuffer);
+                mMpu.dmpGetGravity(&gravity, &q);
+                mMpu.dmpGetYawPitchRoll(mYawPitchRoll, &q, &gravity);
+            }
+        }
+
+        void publish(MqttSnClient& iClient, bool iForcePublish)
+        {
+            const char* topics[] = {TOPIC_GYRO_YAW,TOPIC_GYRO_PITCH, TOPIC_GYRO_ROLL};
+            for (int i = 0 ; i < sizeOfArray(mYawPitchRoll) ; i++ ) {
+                //float diff = abs(mYawPitchRoll[i]-mLastPublishedYawPitchRoll[i]);
+
+
+
+                if(iForcePublish || (abs(mYawPitchRoll[i]-mLastPublishedYawPitchRoll[i]) > mThreshold) ) {
+                    mLastPublishedYawPitchRoll[i] = mYawPitchRoll[i];
+                    iClient.publish(topics[i], dtostrf(mYawPitchRoll[i] * 180/M_PI,4,2,sConvertbuffer));
+                }
+            }
+        }
+
+    private:
+        MPU6050 mMpu;
+        uint8_t mFifoBuffer[64];
+        uint16_t mPacketSize;
+        float mThreshold;
+        float mYawPitchRoll[3];
+        float mLastPublishedYawPitchRoll[3];
+};
+
+//-----
 
 MqttSnClient client;
 dht DHT;
@@ -137,31 +218,16 @@ AnalogInputPublisher sAnalogSensors[] = {
     AnalogInputPublisher(PIN_PHOTO,TOPIC_PHOTO,10)
 };
 
+MpuPublisher sMpuPublisher;
+
 PWMServo sServo;
-
-MPU6050 sMpu;
-bool dmpReady = false;  // set true if DMP init was successful
-uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
-uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
-uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
-uint16_t fifoCount;     // count of all bytes currently in FIFO
-uint8_t fifoBuffer[64]; // FIFO storage buffer
-
-Quaternion q;           // [w, x, y, z]         quaternion container
-VectorFloat gravity;    // [x, y, z]            gravity vector
-float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
 
 
 void setup() {
 
-    Wire.begin();
-    TWBR = 24;
-
     Serial.begin(115200);
     //Serial << endl << endl << endl << F("*** Geek Gathering IoT Shield ***") << endl;
     Serial << F(" - Team ID                   = ") << TEAM_ID << endl;
-
-
 
     pinMode(PIN_BUZZER, OUTPUT);
     analogWrite(PIN_BUZZER, 0);
@@ -173,47 +239,18 @@ void setup() {
     pinMode(PIN_RGB_BLUE, OUTPUT);
     analogWrite(PIN_RGB_BLUE, 0xFF);
 
-
     for(int i = 0 ; i < sizeOfArray(sButtons) ; ++i) {
         sButtons[i].begin();
     }
 
-
-
     client.begin(CHIP_ENABLE, CHIP_SELECT, CLIENT_NODE_ID, GATEWAY_NODE_ID, CLIENT_ID, RF_CHANNEL, callback);
     analogWrite(PIN_BUZZER, 0);
 
+    sMpuPublisher.begin();
+
     sServo.attach(SERVO_PIN_A);
 
-
-    sMpu.initialize();
-    //Serial << F("Initializing DMP...") << endl;
-    devStatus = sMpu.dmpInitialize();
-    // supply your own gyro offsets here, scaled for min sensitivity
-    sMpu.setXGyroOffset(220);
-    sMpu.setYGyroOffset(76);
-    sMpu.setZGyroOffset(-85);
-    sMpu.setZAccelOffset(1688); // 1688 factory default for my test chip
-
-    // make sure it worked (returns 0 if so)
-    if (devStatus == 0) {
-        // turn on the DMP, now that it's ready
-        sMpu.setDMPEnabled(true);
-
-        mpuIntStatus = sMpu.getIntStatus();
-        dmpReady = true;
-
-        // get expected DMP packet size for later comparison
-        packetSize = sMpu.dmpGetFIFOPacketSize();
-    } else {
-        // ERROR!
-        // 1 = initial memory load failed
-        // 2 = DMP configuration updates failed
-        // (if it's going to break, usually the code will be 1)
-        Serial << F("DMP failed :")  << devStatus << endl;
-    }
-
-    //Serial << F("Try connect ...") << endl;
+    Serial << F("Try connect ...") << endl;
     connect();
 
     unsigned long now = millis();
@@ -223,6 +260,7 @@ void setup() {
 
 void loop() {
     if(client.loop()) {
+        sMpuPublisher.loop();
         publish();
     }
     else {
@@ -240,10 +278,10 @@ void connect() {
         Serial << F("... and retry connect after delay @ ") <<  (millis() + RETRY_CONNECT_DELAY) << F(" ...") << endl;
         client.begin(CHIP_ENABLE, CHIP_SELECT, CLIENT_NODE_ID, GATEWAY_NODE_ID, CLIENT_ID, RF_CHANNEL, callback);
         analogWrite(PIN_BUZZER, 0);
+        delay(RETRY_CONNECT_DELAY);
         Serial << F("... retry connect ...") << endl;
     }
     Serial << F("... connected") << endl;
-    //client.subscribe(TOPIC_MILLIS);
     client.subscribe(TOPIC_BUZZER);
     client.subscribe(TOPIC_SERVO);
     client.subscribe(TOPIC_RGB_LED);
@@ -258,9 +296,6 @@ void publish() {
     bool mediumLoop = sNextMediumLoop < now;
     bool slowLoop = sNextSlowLoop < now;
 
-    readMpu();
-
-
     for(int i = 0 ; i < sizeOfArray(sButtons) ; ++i) {
         sButtons[i].publish(client);
     }
@@ -270,53 +305,14 @@ void publish() {
         for(int i = 0 ; i < sizeOfArray(sAnalogSensors) ; ++i) {
             sAnalogSensors[i].publish(client,!slowLoop);
         }
+        sMpuPublisher.publish(client,slowLoop);
     }
 
     if(slowLoop) {
         sNextSlowLoop = now + 3000;
         publishDth();
-        publishMpu();
     }
 }
-
-void readMpu() {
-    // reset interrupt flag and get INT_STATUS byte
-    mpuIntStatus = sMpu.getIntStatus();
-
-    // get current FIFO count
-    fifoCount = sMpu.getFIFOCount();
-
-    // check for overflow (this should never happen unless our code is too inefficient)
-    if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
-        // reset so we can continue cleanly
-        sMpu.resetFIFO();
-        Serial.println(F("FIFO overflow!"));
-
-        // otherwise, check for DMP data ready interrupt (this should happen frequently)
-    } else if (mpuIntStatus & 0x02) {
-        // wait for correct available data length, should be a VERY short wait
-        while (fifoCount < packetSize) fifoCount = sMpu.getFIFOCount();
-
-        // read a packet from FIFO
-        sMpu.getFIFOBytes(fifoBuffer, packetSize);
-
-        // track FIFO count here in case there is > 1 packet available
-        // (this lets us immediately read more without waiting for an interrupt)
-        fifoCount -= packetSize;
-
-        sMpu.dmpGetQuaternion(&q, fifoBuffer);
-        sMpu.dmpGetGravity(&gravity, &q);
-        sMpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-    }
-}
-
-void publishMpu() {
-    client.publish(TOPIC_GYRO_YAW, dtostrf(ypr[0] * 180/M_PI,4,2,sConvertbuffer));
-    client.publish(TOPIC_GYRO_PITCH, dtostrf(ypr[1] * 180/M_PI,4,2,sConvertbuffer));
-    client.publish(TOPIC_GYRO_ROW, dtostrf(ypr[2] * 180/M_PI,4,2,sConvertbuffer));
-}
-
-
 
 void publishDth() {
     int answer = DHT.read22(DHT22_PIN);
