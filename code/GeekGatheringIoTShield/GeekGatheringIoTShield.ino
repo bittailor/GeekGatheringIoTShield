@@ -8,7 +8,7 @@
 
 //-----
 
-#define TEAM_ID 5
+#define TEAM_ID 4
 
 //-----
 
@@ -35,7 +35,6 @@
 
 #define GATEWAY_NODE_ID 0
 
-#define DHT22_READ_INTERVAL 5000
 #define RETRY_CONNECT_DELAY 10000
 
 #define CHIP_ENABLE 7
@@ -54,9 +53,14 @@
 #define PIN_RGB_GREEN 5
 #define PIN_RGB_BLUE 6
 
+#define RGB_BLACK 0x000000
+#define RGB_DARK_ORANGE 0xFF8C00
+#define RGB_RED 0x0F0000
+#define RGB_GREEN 0x000F00
 
 //-----
-char sConvertbuffer[20] = {0};
+char sConvertbuffer[10] = {0};
+
 //-----
 
 
@@ -80,7 +84,7 @@ class DigitalInputPublisher {
             bool state = digitalRead(mPin) == LOW;
             if(state != mState) {
                 mState = state;
-                iClient.publish(mTopic, state ? "ON" : "OFF");
+                iClient.publish(mTopic, state ? "1" : "0");
             }
         }
 
@@ -102,14 +106,14 @@ class AnalogInputPublisher {
     : mPin(iPin), mTopic(iTopic), mThreshold(iThreshold), mLastPublishedValue(0) {
     }
 
-    void publish(MqttSnClient& iClient, bool iOnlyWhenChanged)
+    void publish(MqttSnClient& iClient, bool iForcePublish)
     {
         int value = analogRead(mPin);
-        if(iOnlyWhenChanged && abs(value-mLastPublishedValue) < mThreshold) {
-            return;
+        if(iForcePublish || abs(value-mLastPublishedValue) > mThreshold) {
+          mLastPublishedValue = value;
+          iClient.publish(mTopic, itoa(value,sConvertbuffer,10));;
         }
-        mLastPublishedValue = value;
-        iClient.publish(mTopic, itoa(value,sConvertbuffer,10));
+
     }
 
     private:
@@ -128,30 +132,24 @@ class MpuPublisher {
         : mThreshold(1.0 * M_PI / 180) {
         }
 
-
         void begin() {
             Wire.begin();
             TWBR = 24;
             mMpu.initialize();
-            //Serial << F("Initializing DMP...") << endl;
             uint8_t devStatus = mMpu.dmpInitialize();
-            // supply your own gyro offsets here, scaled for min sensitivity
+
             mMpu.setXGyroOffset(220);
             mMpu.setYGyroOffset(76);
             mMpu.setZGyroOffset(-85);
-            mMpu.setZAccelOffset(1688); // 1688 factory default for my test chip
+            mMpu.setZAccelOffset(1688);
 
-            // make sure it worked (returns 0 if so)
             if (devStatus == 0) {
-                // turn on the DMP, now that it's ready
                 mMpu.setDMPEnabled(true);
                 mPacketSize = mMpu.dmpGetFIFOPacketSize();
             } else {
-                // ERROR!
                 // 1 = initial memory load failed
                 // 2 = DMP configuration updates failed
-                // (if it's going to break, usually the code will be 1)
-                Serial << F("DMP failed :")  << devStatus << endl;
+                Serial << F("MPU failure : ")  << devStatus << endl;
             }
         }
 
@@ -163,15 +161,13 @@ class MpuPublisher {
                 Serial << F("MPU reset fifo") << endl;
                 mMpu.resetFIFO();
             } else if (mpuIntStatus & 0x02) {
-                // wait for correct available data length, should be a VERY short wait
+                // wait for correct available data length
                 while (fifoCount < mPacketSize) fifoCount = mMpu.getFIFOCount();
 
-                // read a packet from FIFO
                 mMpu.getFIFOBytes(mFifoBuffer, mPacketSize);
 
                 Quaternion q;
                 VectorFloat gravity;
-
                 mMpu.dmpGetQuaternion(&q, mFifoBuffer);
                 mMpu.dmpGetGravity(&gravity, &q);
                 mMpu.dmpGetYawPitchRoll(mYawPitchRoll, &q, &gravity);
@@ -182,10 +178,6 @@ class MpuPublisher {
         {
             const char* topics[] = {TOPIC_GYRO_YAW,TOPIC_GYRO_PITCH, TOPIC_GYRO_ROLL};
             for (int i = 0 ; i < sizeOfArray(mYawPitchRoll) ; i++ ) {
-                //float diff = abs(mYawPitchRoll[i]-mLastPublishedYawPitchRoll[i]);
-
-
-
                 if(iForcePublish || (abs(mYawPitchRoll[i]-mLastPublishedYawPitchRoll[i]) > mThreshold) ) {
                     mLastPublishedYawPitchRoll[i] = mYawPitchRoll[i];
                     iClient.publish(topics[i], dtostrf(mYawPitchRoll[i] * 180/M_PI,4,2,sConvertbuffer));
@@ -233,11 +225,10 @@ void setup() {
     analogWrite(PIN_BUZZER, 0);
 
     pinMode(PIN_RGB_RED, OUTPUT);
-    analogWrite(PIN_RGB_RED, 0xFF);
     pinMode(PIN_RGB_GREEN, OUTPUT);
-    analogWrite(PIN_RGB_GREEN, 0xFF);
     pinMode(PIN_RGB_BLUE, OUTPUT);
-    analogWrite(PIN_RGB_BLUE, 0xFF);
+    setRgbLed(RGB_DARK_ORANGE);
+
 
     for(int i = 0 ; i < sizeOfArray(sButtons) ; ++i) {
         sButtons[i].begin();
@@ -264,6 +255,7 @@ void loop() {
         publish();
     }
     else {
+        setRgbLed(RGB_RED);
         Serial << F("Connection lost try reconnect ...") << endl;
         connect();
         lastConnect = millis();
@@ -273,6 +265,7 @@ void loop() {
 
 void connect() {
     while (!client.connect()) {
+        setRgbLed(RGB_RED);
         Serial << F("... connect failed, reset client ... ") << endl;
         client.end();
         Serial << F("... and retry connect after delay @ ") <<  (millis() + RETRY_CONNECT_DELAY) << F(" ...") << endl;
@@ -281,6 +274,7 @@ void connect() {
         delay(RETRY_CONNECT_DELAY);
         Serial << F("... retry connect ...") << endl;
     }
+    setRgbLed(RGB_GREEN);
     Serial << F("... connected") << endl;
     client.subscribe(TOPIC_BUZZER);
     client.subscribe(TOPIC_SERVO);
@@ -303,7 +297,7 @@ void publish() {
     if(mediumLoop || slowLoop) {
         sNextMediumLoop = now + 100;
         for(int i = 0 ; i < sizeOfArray(sAnalogSensors) ; ++i) {
-            sAnalogSensors[i].publish(client,!slowLoop);
+            sAnalogSensors[i].publish(client,slowLoop);
         }
         sMpuPublisher.publish(client,slowLoop);
     }
@@ -369,9 +363,13 @@ void handleRgbLed(const char* iData) {
         return;
     }
     long colors = strtol(iData+1,NULL,16);
-    analogWrite(PIN_RGB_BLUE, 0xFF - (colors & 0xff));
-    colors = colors >> 8;
-    analogWrite(PIN_RGB_GREEN, 0xFF - (colors & 0xff));
-    colors = colors >> 8;
-    analogWrite(PIN_RGB_RED, 0xFF -  (colors & 0xff));
+    setRgbLed(colors);
+}
+
+void setRgbLed(long colors) {
+  analogWrite(PIN_RGB_BLUE, 0xFF - (colors & 0xff));
+  colors = colors >> 8;
+  analogWrite(PIN_RGB_GREEN, 0xFF - (colors & 0xff));
+  colors = colors >> 8;
+  analogWrite(PIN_RGB_RED, 0xFF -  (colors & 0xff));
 }
